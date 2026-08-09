@@ -1,83 +1,99 @@
 #!/usr/bin/env bash
 # ============================================================
-# NRB PANEL - ZERO-APT DOCKER / CODESPACES INSTALLER
-# Repository: https://github.com/notroboy67-htp/Panel
+# NRB PANEL - CLEAN DOCKER / CODESPACES INSTALLER
+# ============================================================
 #
-# IMPORTANT:
-#   This installer NEVER runs apt, apt-get, dpkg, or installs Git.
-#   This avoids Docker/Codespaces "Invalid cross-device link"
-#   package errors.
+# This installer was written after inspecting mcpanelv1.zip.
+#
+# It intentionally uses:
+#   - NO apt
+#   - NO apt-get
+#   - NO dpkg
+#   - NO git
+#   - NO sudo
+#
+# It downloads the GitHub repository with Python, extracts the
+# repository and mcpanelv1.zip with Python, installs Node.js
+# locally when necessary, installs npm dependencies, validates
+# app.js, and starts the actual app with "npm start".
+#
+# Repository:
+#   https://github.com/notroboy67-htp/Panel
 # ============================================================
 
 set -Eeuo pipefail
 
 REPO_ZIP_URL="https://github.com/notroboy67-htp/Panel/archive/refs/heads/main.zip"
-BASE_DIR="${HOME}/nrb-panel"
-REPO_ZIP="${BASE_DIR}/repository.zip"
-REPO_EXTRACT="${BASE_DIR}/repository"
-PANEL_EXTRACT="${BASE_DIR}/panel"
+
+BASE_DIR="${BASE_DIR:-${HOME}/nrb-panel}"
+REPO_ARCHIVE="${BASE_DIR}/panel-repository.zip"
+REPO_DIR="${BASE_DIR}/repository"
+APP_DIR="${BASE_DIR}/app"
 NODE_DIR="${BASE_DIR}/node"
-PANEL_PORT="${PANEL_PORT:-3000}"
 NODE_VERSION="${NODE_VERSION:-20.19.4}"
+PORT="${PORT:-3000}"
 
 log()  { printf '\033[1;32m[NRB]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[WARN]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
 
-has() { command -v "$1" >/dev/null 2>&1; }
-
 # ------------------------------------------------------------
-# We intentionally do not use apt/dpkg.
+# Required base tools
 # ------------------------------------------------------------
 
-log "Starting ZERO-APT Docker/Codespaces installer..."
+command -v python3 >/dev/null 2>&1 || die \
+"python3 is required. This installer will NOT use apt to install it."
 
-if ! has curl && ! has wget; then
-    die "curl or wget is required to download the Panel repository."
-fi
+python3 - <<'PY'
+import sys
+required = ["ssl", "urllib.request", "zipfile", "tarfile", "lzma"]
+missing = []
+for name in required:
+    try:
+        __import__(name)
+    except Exception:
+        missing.append(name)
+if missing:
+    print("Missing Python modules:", ", ".join(missing))
+    raise SystemExit(1)
+PY
 
-if ! has python3; then
-    die "python3 is required for ZIP extraction.
-This installer intentionally does not install Python with apt,
-because your container has a broken dpkg/filesystem setup."
-fi
-
-has tar || die "tar is required."
-has xz || die "xz is required for the Node.js archive."
-
-# ------------------------------------------------------------
-# Prepare directories
-# ------------------------------------------------------------
-
-rm -rf "${BASE_DIR}"
-mkdir -p "${BASE_DIR}" "${REPO_EXTRACT}" "${PANEL_EXTRACT}"
+log "Python: $(python3 --version)"
 
 # ------------------------------------------------------------
-# Download repository directly from GitHub.
-# This completely avoids Git and apt/dpkg.
+# Python helper: download
 # ------------------------------------------------------------
 
-log "Downloading Panel repository from GitHub..."
+py_download() {
+    python3 - "$1" "$2" <<'PY'
+import sys
+import urllib.request
 
-if has curl; then
-    curl -fL --retry 5 --connect-timeout 15 \
-        "${REPO_ZIP_URL}" -o "${REPO_ZIP}" \
-        || die "Failed to download the Panel repository."
-else
-    wget -q --show-progress \
-        "${REPO_ZIP_URL}" -O "${REPO_ZIP}" \
-        || die "Failed to download the Panel repository."
-fi
+url, destination = sys.argv[1], sys.argv[2]
 
-[ -s "${REPO_ZIP}" ] || die "Downloaded repository archive is empty."
+request = urllib.request.Request(
+    url,
+    headers={"User-Agent": "NRB-Panel-Installer/1.0"}
+)
+
+with urllib.request.urlopen(request, timeout=60) as response:
+    with open(destination, "wb") as out:
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            out.write(chunk)
+
+print(f"Downloaded: {destination}")
+PY
+}
 
 # ------------------------------------------------------------
-# Extract repository ZIP using Python stdlib.
+# Python helper: extract ZIP
 # ------------------------------------------------------------
 
-log "Extracting repository..."
-
-python3 - "${REPO_ZIP}" "${REPO_EXTRACT}" <<'PY'
+py_extract_zip() {
+    python3 - "$1" "$2" <<'PY'
 import sys
 import zipfile
 from pathlib import Path
@@ -92,66 +108,127 @@ with zipfile.ZipFile(archive, "r") as z:
         raise SystemExit(f"Corrupt ZIP entry: {bad}")
     z.extractall(destination)
 PY
-
-REPO_ROOT="$(find "${REPO_EXTRACT}" -mindepth 1 -maxdepth 1 -type d -print -quit)"
-[ -n "${REPO_ROOT}" ] || die "Could not locate extracted repository."
+}
 
 # ------------------------------------------------------------
-# Find mcpanelv1.zip.
+# Python helper: extract Node's .tar.xz
+# ------------------------------------------------------------
+
+py_extract_tar_xz() {
+    python3 - "$1" "$2" <<'PY'
+import sys
+import tarfile
+from pathlib import Path
+
+archive = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+destination.mkdir(parents=True, exist_ok=True)
+
+with tarfile.open(archive, "r:xz") as tar:
+    tar.extractall(destination, filter="data")
+PY
+}
+
+# ------------------------------------------------------------
+# Fresh working directory
+# ------------------------------------------------------------
+
+log "Cleaning previous installer files..."
+rm -rf "${BASE_DIR}"
+mkdir -p "${BASE_DIR}" "${REPO_DIR}" "${APP_DIR}" "${NODE_DIR}"
+
+# ------------------------------------------------------------
+# Download the GitHub repository WITHOUT git
+# ------------------------------------------------------------
+
+log "Downloading Panel repository..."
+
+py_download "${REPO_ZIP_URL}" "${REPO_ARCHIVE}" \
+    || die "Could not download the Panel repository."
+
+[ -s "${REPO_ARCHIVE}" ] || die "Repository archive is empty."
+
+log "Extracting repository..."
+py_extract_zip "${REPO_ARCHIVE}" "${REPO_DIR}" \
+    || die "Could not extract the repository."
+
+REPO_ROOT="$(find "${REPO_DIR}" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+
+[ -n "${REPO_ROOT}" ] || die "GitHub repository directory was not found."
+
+# ------------------------------------------------------------
+# Locate mcpanelv1.zip
 # ------------------------------------------------------------
 
 ZIP_FILE="$(find "${REPO_ROOT}" -maxdepth 3 -type f \
-    \( -iname 'mcpanelv1.zip' -o -iname '*.zip' \) \
-    -print -quit || true)"
+    -iname 'mcpanelv1.zip' -print -quit || true)"
 
-[ -n "${ZIP_FILE}" ] || die "mcpanelv1.zip was not found in the GitHub repository."
+if [ -z "${ZIP_FILE}" ]; then
+    ZIP_FILE="$(find "${REPO_ROOT}" -maxdepth 3 -type f \
+        -iname '*.zip' -print -quit || true)"
+fi
 
-log "Found: ${ZIP_FILE}"
+[ -n "${ZIP_FILE}" ] || die \
+"mcpanelv1.zip was not found in the Panel repository."
+
+log "Found panel archive: ${ZIP_FILE}"
 
 # ------------------------------------------------------------
-# Extract mcpanelv1.zip.
+# Extract mcpanelv1.zip
 # ------------------------------------------------------------
 
 log "Extracting mcpanelv1.zip..."
+rm -rf "${APP_DIR}"
+mkdir -p "${APP_DIR}"
 
-python3 - "${ZIP_FILE}" "${PANEL_EXTRACT}" <<'PY'
-import sys
-import zipfile
-from pathlib import Path
+py_extract_zip "${ZIP_FILE}" "${APP_DIR}" \
+    || die "Could not extract mcpanelv1.zip."
 
-archive = Path(sys.argv[1])
-destination = Path(sys.argv[2])
-destination.mkdir(parents=True, exist_ok=True)
-
-with zipfile.ZipFile(archive, "r") as z:
-    bad = z.testzip()
-    if bad:
-        raise SystemExit(f"Corrupt ZIP entry: {bad}")
-    z.extractall(destination)
-PY
-
-# ------------------------------------------------------------
-# Locate actual Node.js panel directory.
-# ------------------------------------------------------------
-
-PACKAGE_JSON="$(find "${PANEL_EXTRACT}" -type f -name package.json -print -quit || true)"
-[ -n "${PACKAGE_JSON}" ] || die "package.json was not found inside mcpanelv1.zip."
-
-PANEL_DIR="$(dirname "${PACKAGE_JSON}")"
-cd "${PANEL_DIR}"
-
-log "Panel directory: ${PANEL_DIR}"
-
-# ------------------------------------------------------------
-# Install Node.js WITHOUT apt/dpkg if necessary.
-# ------------------------------------------------------------
-
-if has node && has npm; then
-    log "Existing Node.js: $(node --version)"
-    log "Existing npm: $(npm --version)"
+# The uploaded archive has a top-level panel/ directory.
+if [ -f "${APP_DIR}/panel/package.json" ]; then
+    APP_ROOT="${APP_DIR}/panel"
 else
-    log "Node.js/npm not found."
-    log "Downloading official Node.js ${NODE_VERSION} binary..."
+    APP_ROOT="$(find "${APP_DIR}" -type f -name package.json \
+        -print -quit | xargs -r dirname)"
+fi
+
+[ -n "${APP_ROOT}" ] || die \
+"package.json was not found inside mcpanelv1.zip."
+
+cd "${APP_ROOT}"
+
+log "Application directory: ${APP_ROOT}"
+
+# ------------------------------------------------------------
+# Check the actual project we inspected
+# ------------------------------------------------------------
+
+[ -f package.json ] || die "package.json is missing."
+[ -f app.js ] || warn "app.js was not found; startup will use package.json."
+
+# Syntax check before installing/starting.
+if command -v node >/dev/null 2>&1; then
+    node --check app.js || die "app.js has a JavaScript syntax error."
+fi
+
+# ------------------------------------------------------------
+# Node.js
+# ------------------------------------------------------------
+
+if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+    NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
+
+    if [ "${NODE_MAJOR}" -ge 18 ]; then
+        log "Using existing Node.js $(node --version)"
+        log "Using existing npm $(npm --version)"
+    else
+        warn "Existing Node.js is too old (${NODE_MAJOR})."
+        unset NODE_MAJOR
+    fi
+fi
+
+if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+    log "Installing Node.js ${NODE_VERSION} locally (NO apt/dpkg)..."
 
     ARCH="$(uname -m)"
     case "${ARCH}" in
@@ -161,137 +238,171 @@ else
         *) die "Unsupported CPU architecture: ${ARCH}" ;;
     esac
 
-    NODE_FILE="node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz"
-    NODE_URL="https://nodejs.org/dist/v${NODE_VERSION}/${NODE_FILE}"
+    NODE_ARCHIVE="${BASE_DIR}/node.tar.xz"
+    NODE_URL="https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz"
 
-    rm -rf "${NODE_DIR}"
-    mkdir -p "${NODE_DIR}"
+    py_download "${NODE_URL}" "${NODE_ARCHIVE}" \
+        || die "Could not download Node.js ${NODE_VERSION}."
 
-    if has curl; then
-        curl -fL --retry 5 --connect-timeout 15 \
-            "${NODE_URL}" -o "${BASE_DIR}/${NODE_FILE}" \
-            || die "Failed to download Node.js."
-    else
-        wget -q --show-progress \
-            "${NODE_URL}" -O "${BASE_DIR}/${NODE_FILE}" \
-            || die "Failed to download Node.js."
-    fi
+    py_extract_tar_xz "${NODE_ARCHIVE}" "${NODE_DIR}" \
+        || die "Could not extract Node.js."
 
-    tar -xJf "${BASE_DIR}/${NODE_FILE}" -C "${NODE_DIR}" \
-        || die "Failed to extract Node.js."
+    NODE_ROOT="$(find "${NODE_DIR}" -mindepth 1 -maxdepth 1 \
+        -type d -name 'node-v*' -print -quit)"
 
-    NODE_ROOT="$(find "${NODE_DIR}" -mindepth 1 -maxdepth 1 -type d -name 'node-v*' -print -quit)"
-    [ -n "${NODE_ROOT}" ] || die "Node.js extraction directory not found."
+    [ -n "${NODE_ROOT}" ] || die "Node.js directory was not found."
 
     export PATH="${NODE_ROOT}/bin:${PATH}"
 
-    rm -f "${BASE_DIR}/${NODE_FILE}"
+    command -v node >/dev/null 2>&1 || die "Node.js installation failed."
+    command -v npm >/dev/null 2>&1 || die "npm installation failed."
 
-    has node || die "Node.js installation failed."
-    has npm || die "npm installation failed."
-
-    log "Node.js installed: $(node --version)"
-    log "npm installed: $(npm --version)"
+    log "Node.js: $(node --version)"
+    log "npm: $(npm --version)"
 fi
 
 # ------------------------------------------------------------
-# Install panel dependencies.
+# Final syntax check using the Node version we will actually use
 # ------------------------------------------------------------
 
-log "Installing npm dependencies..."
+node --check app.js || die "app.js failed Node.js syntax validation."
+
+# ------------------------------------------------------------
+# Install dependencies
+# ------------------------------------------------------------
+
+log "Installing panel dependencies..."
+log "This may take a few minutes because the panel uses SQLite/native modules."
+
+export npm_config_audit=false
+export npm_config_fund=false
 
 if [ -f package-lock.json ]; then
-    npm ci --omit=dev || {
-        warn "npm ci failed; retrying with npm install..."
-        npm install --omit=dev
-    }
+    npm ci --omit=dev
 else
     npm install --omit=dev
 fi
 
-npm rebuild >/dev/null 2>&1 || \
-    warn "npm rebuild returned an error; continuing."
+# Rebuild native modules such as sqlite3/bcrypt when necessary.
+npm rebuild || warn "npm rebuild reported a problem; continuing to startup test."
+
+# Verify critical modules used directly by app.js.
+node - <<'NODE'
+const modules = [
+  "express",
+  "express-session",
+  "sqlite3",
+  "bcryptjs",
+  "multer",
+  "socket.io",
+  "axios",
+  "rcon-client",
+  "prismarine-nbt"
+];
+
+const missing = [];
+
+for (const name of modules) {
+  try {
+    require(name);
+  } catch (e) {
+    missing.push(`${name}: ${e.message}`);
+  }
+}
+
+if (missing.length) {
+  console.error("\nMissing/broken required modules:");
+  for (const item of missing) console.error(" - " + item);
+  process.exit(1);
+}
+
+console.log("Required Node.js modules: OK");
+NODE
 
 # ------------------------------------------------------------
-# Determine how the panel starts.
+# Prepare writable runtime directories
+# ------------------------------------------------------------
+
+mkdir -p \
+    "${APP_ROOT}/servers" \
+    "${APP_ROOT}/backups" \
+    "${APP_ROOT}/uploads" \
+    "${APP_ROOT}/temp" \
+    "${APP_ROOT}/public/uploads" \
+    "${APP_ROOT}/public/uploads/profiles"
+
+# ------------------------------------------------------------
+# Database
+# ------------------------------------------------------------
+#
+# app.js creates/opens database.db itself. We intentionally do
+# NOT run init-database.js because that file references
+# database-updates.sql, which is not included in the supplied ZIP.
+#
+# This is based on inspection of the uploaded project.
+# ------------------------------------------------------------
+
+if [ -f "${APP_ROOT}/database.db" ]; then
+    log "Existing database.db found; preserving it."
+else
+    log "database.db will be created automatically by app.js."
+fi
+
+# ------------------------------------------------------------
+# Detect Java
+# ------------------------------------------------------------
+
+if command -v java >/dev/null 2>&1; then
+    log "Java: $(java -version 2>&1 | head -n 1)"
+else
+    warn "Java is not installed."
+    warn "The web panel can start, but Minecraft Java servers launched"
+    warn "from the panel will require Java to be installed in the container."
+fi
+
+# ------------------------------------------------------------
+# Start command
 # ------------------------------------------------------------
 
 START_SCRIPT="$(node -e '
-try {
-  const p=require("./package.json");
-  process.stdout.write((p.scripts && p.scripts.start) || "");
-} catch(e) {}
+const p=require("./package.json");
+process.stdout.write((p.scripts && p.scripts.start) || "");
 ' 2>/dev/null || true)"
-
-START_MODE=""
-ENTRY_FILE=""
 
 if [ -n "${START_SCRIPT}" ]; then
-    START_MODE="npm"
+    START="npm start"
 else
-    for candidate in app.js server.js index.js main.js; do
-        if [ -f "${candidate}" ]; then
-            ENTRY_FILE="${candidate}"
-            break
-        fi
-    done
-
-    if [ -z "${ENTRY_FILE}" ]; then
-        PACKAGE_MAIN="$(node -e '
-try {
-  const p=require("./package.json");
-  process.stdout.write(p.main || "");
-} catch(e) {}
-' 2>/dev/null || true)"
-
-        if [ -n "${PACKAGE_MAIN}" ] && [ -f "${PACKAGE_MAIN}" ]; then
-            ENTRY_FILE="${PACKAGE_MAIN}"
-        fi
-    fi
-
-    [ -n "${ENTRY_FILE}" ] && START_MODE="node"
+    START="node app.js"
 fi
 
-[ -n "${START_MODE}" ] || \
-    die "Could not determine the panel startup command."
+# ------------------------------------------------------------
+# Final information
+# ------------------------------------------------------------
+
+echo
+echo "============================================================"
+echo "             NRB PANEL - READY"
+echo "============================================================"
+echo
+echo "Project : Minecraft Server Panel"
+echo "Path    : ${APP_ROOT}"
+echo "Node    : $(node --version)"
+echo "npm     : $(npm --version)"
+echo "Port    : ${PORT}"
+echo "Start   : ${START}"
+echo
+echo "Docker:"
+echo "  Publish/expose TCP port ${PORT}."
+echo
+echo "GitHub Codespaces:"
+echo "  Forward TCP port ${PORT} in the Ports tab."
+echo
+echo "The panel will now run in the foreground."
+echo "Press Ctrl+C to stop it."
+echo "============================================================"
+echo
 
 export NODE_ENV="${NODE_ENV:-production}"
-export PORT="${PANEL_PORT}"
+export PORT
 
-mkdir -p servers backups uploads temp 2>/dev/null || true
-
-# ------------------------------------------------------------
-# Final message
-# ------------------------------------------------------------
-
-echo
-echo "============================================================"
-echo "       NRB PANEL - INSTALLATION COMPLETE"
-echo "============================================================"
-echo
-echo "Repository : notroboy67-htp/Panel"
-echo "Panel      : ${PANEL_DIR}"
-echo "Port       : ${PANEL_PORT}"
-echo "Node       : $(node --version)"
-echo "npm        : $(npm --version)"
-echo
-
-if [ "${START_MODE}" = "npm" ]; then
-    echo "Starting with: npm start"
-else
-    echo "Starting with: node ${ENTRY_FILE}"
-fi
-
-echo
-echo "Docker: publish/expose port ${PANEL_PORT}."
-echo "Codespaces: forward port ${PANEL_PORT}."
-echo
-echo "============================================================"
-echo
-
-# Keep the Node process in the foreground for Docker/Codespaces.
-if [ "${START_MODE}" = "npm" ]; then
-    exec npm start
-else
-    exec node "${ENTRY_FILE}"
-fi
+exec npm start
