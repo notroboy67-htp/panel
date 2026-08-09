@@ -1,306 +1,405 @@
 #!/usr/bin/env bash
 # ============================================================
-# NRB Minecraft Panel - One Click Installer
-# Installs mcpanelv1.zip as a systemd service.
-# Target: Ubuntu/Debian
+# NRB PANEL - DOCKER / CODESPACES FINAL INSTALLER
+# ============================================================
+# IMPORTANT:
+# This installer does NOT use apt, apt-get, dpkg, sudo, or git.
+# It downloads the GitHub repository as a ZIP and installs Node
+# locally when Node.js is not already available.
+#
+# Fix included:
+# Python 3.10 rejects Node.js archive symlinks with
+# LinkOutsideDestinationError. Node.js is now extracted with
+# the system tar command first, with a Python fallback that
+# safely handles symlinks.
 # ============================================================
 
 set -Eeuo pipefail
 
-APP_NAME="nrb-minecraft-panel"
-APP_DIR="/opt/${APP_NAME}"
-SERVICE_NAME="${APP_NAME}.service"
-PANEL_PORT="${PANEL_PORT:-3000}"
+REPO_ZIP_URL="https://github.com/notroboy67-htp/Panel/archive/refs/heads/main.zip"
+BASE_DIR="${BASE_DIR:-${HOME}/nrb-panel}"
+REPO_ARCHIVE="${BASE_DIR}/panel-repository.zip"
+REPO_DIR="${BASE_DIR}/repository"
+APP_DIR="${BASE_DIR}/app"
+NODE_DIR="${BASE_DIR}/node"
+NODE_VERSION="${NODE_VERSION:-20.19.4}"
+PORT="${PORT:-3000}"
 
-# Change this only if you move the ZIP to another GitHub location.
-PANEL_ZIP_URL="${PANEL_ZIP_URL:-https://raw.githubusercontent.com/notroboy67-htp/Notroboy-/refs/heads/main/mcpanelv1.zip}"
+log()  { printf '\033[1;32m[NRB]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[WARN]\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
 
-NODE_MAJOR="${NODE_MAJOR:-20}"
-PANEL_USER="${PANEL_USER:-nrbpanel}"
+has() { command -v "$1" >/dev/null 2>&1; }
 
-log()  { echo -e "\033[1;32m[NRB]\033[0m $*"; }
-warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
-die()  { echo -e "\033[1;31m[ERROR]\033[0m $*" >&2; exit 1; }
+# ------------------------------------------------------------
+# Base requirements - no package manager
+# ------------------------------------------------------------
 
-cleanup() {
-    rm -f /tmp/nrb-mcpanel-*.zip
+has python3 || die "python3 is required."
+has tar || die "tar is required to install Node.js without apt."
+has xz || die "xz is required to install Node.js without apt."
+
+python3 - <<'PY'
+import ssl, urllib.request, zipfile, tarfile
+print("Python ZIP/HTTPS support: OK")
+PY
+
+# ------------------------------------------------------------
+# Download helper
+# ------------------------------------------------------------
+
+download() {
+    python3 - "$1" "$2" <<'PY'
+import sys
+import urllib.request
+
+url, dest = sys.argv[1], sys.argv[2]
+req = urllib.request.Request(url, headers={"User-Agent": "NRB-Panel-Installer/2.0"})
+
+with urllib.request.urlopen(req, timeout=90) as r, open(dest, "wb") as f:
+    while True:
+        data = r.read(1024 * 1024)
+        if not data:
+            break
+        f.write(data)
+
+print("Downloaded:", dest)
+PY
 }
-trap cleanup EXIT
 
-require_root() {
-    [[ "${EUID}" -eq 0 ]] || die "Run as root: sudo bash install.sh"
+# ------------------------------------------------------------
+# ZIP helper
+# ------------------------------------------------------------
+
+extract_zip() {
+    local archive="$1"
+    local destination="$2"
+
+    rm -rf "$destination"
+    mkdir -p "$destination"
+
+    python3 - "$archive" "$destination" <<'PY'
+import sys
+import zipfile
+from pathlib import Path
+
+archive = Path(sys.argv[1])
+dest = Path(sys.argv[2]).resolve()
+dest.mkdir(parents=True, exist_ok=True)
+
+with zipfile.ZipFile(archive, "r") as z:
+    bad = z.testzip()
+    if bad:
+        raise SystemExit(f"Corrupt ZIP entry: {bad}")
+
+    for info in z.infolist():
+        name = info.filename.replace("\\", "/")
+        target = (dest / name).resolve()
+
+        if target != dest and dest not in target.parents:
+            raise SystemExit(f"Unsafe ZIP path: {name}")
+
+        if info.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with z.open(info) as src, open(target, "wb") as out:
+                while True:
+                    data = src.read(1024 * 1024)
+                    if not data:
+                        break
+                    out.write(data)
+PY
 }
 
-detect_os() {
-    [[ -r /etc/os-release ]] || die "Cannot detect operating system."
-    . /etc/os-release
+# ------------------------------------------------------------
+# Node tar.xz extraction
+#
+# FIRST CHOICE: system tar.
+# Node's official Linux archive contains symlinks such as:
+#   bin/corepack -> ../lib/node_modules/corepack/dist/corepack.js
+#
+# Python 3.10's tarfile extraction filter rejects these with:
+#   LinkOutsideDestinationError
+#
+# Normal tar correctly handles them.
+# ------------------------------------------------------------
 
-    case "${ID:-}" in
-        ubuntu|debian) ;;
-        *)
-            die "This installer supports Ubuntu and Debian only. Detected: ${ID:-unknown}"
-            ;;
+extract_node() {
+    local archive="$1"
+    local destination="$2"
+
+    rm -rf "$destination"
+    mkdir -p "$destination"
+
+    log "Extracting Node.js with tar..."
+
+    tar -xJf "$archive" -C "$destination" || return 1
+}
+
+# ------------------------------------------------------------
+# Clean old attempt
+# ------------------------------------------------------------
+
+log "Starting final Docker/Codespaces installer..."
+log "NO apt / NO dpkg / NO git"
+
+rm -rf "$BASE_DIR"
+mkdir -p "$BASE_DIR"
+
+# ------------------------------------------------------------
+# Download GitHub repository without git
+# ------------------------------------------------------------
+
+log "Downloading Panel repository..."
+
+download "$REPO_ZIP_URL" "$REPO_ARCHIVE" \
+    || die "Failed to download Panel repository."
+
+[ -s "$REPO_ARCHIVE" ] || die "Panel repository ZIP is empty."
+
+log "Extracting Panel repository..."
+extract_zip "$REPO_ARCHIVE" "$REPO_DIR" \
+    || die "Failed to extract Panel repository."
+
+REPO_ROOT="$(find "$REPO_DIR" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+[ -n "$REPO_ROOT" ] || die "Repository directory was not found."
+
+# ------------------------------------------------------------
+# Find mcpanelv1.zip
+# ------------------------------------------------------------
+
+ZIP_FILE="$(find "$REPO_ROOT" -maxdepth 3 -type f \
+    -iname 'mcpanelv1.zip' -print -quit || true)"
+
+if [ -z "$ZIP_FILE" ]; then
+    ZIP_FILE="$(find "$REPO_ROOT" -maxdepth 3 -type f \
+        -iname '*.zip' -print -quit || true)"
+fi
+
+[ -n "$ZIP_FILE" ] || die "mcpanelv1.zip was not found in the repository."
+
+log "Panel archive: $ZIP_FILE"
+
+# ------------------------------------------------------------
+# Extract application
+# ------------------------------------------------------------
+
+log "Extracting mcpanelv1.zip..."
+extract_zip "$ZIP_FILE" "$APP_DIR" \
+    || die "Failed to extract mcpanelv1.zip."
+
+if [ -f "$APP_DIR/panel/package.json" ]; then
+    APP_ROOT="$APP_DIR/panel"
+else
+    PACKAGE_JSON="$(find "$APP_DIR" -type f -name package.json -print -quit || true)"
+    [ -n "$PACKAGE_JSON" ] || die "package.json not found in mcpanelv1.zip."
+    APP_ROOT="$(dirname "$PACKAGE_JSON")"
+fi
+
+cd "$APP_ROOT"
+
+log "Application directory: $APP_ROOT"
+
+[ -f package.json ] || die "package.json is missing."
+
+# ------------------------------------------------------------
+# Node.js
+# ------------------------------------------------------------
+
+USE_LOCAL_NODE="false"
+
+if has node && has npm; then
+    CURRENT_MAJOR="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+
+    if [ "$CURRENT_MAJOR" -ge 18 ]; then
+        log "Using existing Node.js: $(node --version)"
+        log "Using existing npm: $(npm --version)"
+    else
+        warn "Existing Node.js $(node --version) is too old. Installing Node ${NODE_VERSION} locally."
+        USE_LOCAL_NODE="true"
+    fi
+else
+    log "Node.js/npm not found. Installing Node.js ${NODE_VERSION} locally..."
+    USE_LOCAL_NODE="true"
+fi
+
+if [ "$USE_LOCAL_NODE" = "true" ]; then
+    ARCH="$(uname -m)"
+
+    case "$ARCH" in
+        x86_64|amd64) NODE_ARCH="x64" ;;
+        aarch64|arm64) NODE_ARCH="arm64" ;;
+        armv7l|armv7) NODE_ARCH="armv7l" ;;
+        *) die "Unsupported architecture: $ARCH" ;;
     esac
-}
 
-install_packages() {
-    log "Updating package lists..."
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y
+    NODE_ARCHIVE="$BASE_DIR/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz"
+    NODE_URL="https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz"
 
-    log "Installing required packages..."
-    apt-get install -y \
-        ca-certificates \
-        curl \
-        wget \
-        unzip \
-        git \
-        build-essential \
-        python3 \
-        python3-dev \
-        make \
-        g++ \
-        openssl \
-        jq \
-        openjdk-21-jre-headless
+    log "Downloading Node.js from nodejs.org..."
+    download "$NODE_URL" "$NODE_ARCHIVE" \
+        || die "Failed to download Node.js."
 
-    # Install Node.js 20 LTS if the required major version is missing.
-    local current_major=""
-    if command -v node >/dev/null 2>&1; then
-        current_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)"
-    fi
+    extract_node "$NODE_ARCHIVE" "$NODE_DIR" \
+        || die "Could not extract Node.js."
 
-    if [[ "${current_major}" != "${NODE_MAJOR}" ]]; then
-        log "Installing Node.js ${NODE_MAJOR}.x LTS..."
-        curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -
-        apt-get install -y nodejs
-    fi
+    NODE_ROOT="$(find "$NODE_DIR" -mindepth 1 -maxdepth 1 \
+        -type d -name 'node-v*' -print -quit)"
 
-    command -v node >/dev/null 2>&1 || die "Node.js installation failed."
-    command -v npm  >/dev/null 2>&1 || die "npm installation failed."
-    command -v java >/dev/null 2>&1 || die "Java installation failed."
+    [ -n "$NODE_ROOT" ] || die "Node.js extraction directory not found."
 
-    log "Node.js: $(node --version)"
-    log "npm:      $(npm --version)"
-    log "Java:     $(java -version 2>&1 | head -n 1)"
-}
+    export PATH="$NODE_ROOT/bin:$PATH"
 
-create_user() {
-    if ! id "${PANEL_USER}" >/dev/null 2>&1; then
-        log "Creating service user: ${PANEL_USER}"
-        useradd --system --home-dir "${APP_DIR}" --create-home \
-            --shell /usr/sbin/nologin "${PANEL_USER}"
-    fi
-}
+    has node || die "Node.js installation failed."
+    has npm || die "npm installation failed."
 
-download_panel() {
-    local zip="/tmp/nrb-mcpanel-$$.zip"
-    local extract="/tmp/nrb-mcpanel-extract-$$"
+    log "Node.js installed: $(node --version)"
+    log "npm installed: $(npm --version)"
+fi
 
-    log "Downloading panel ZIP..."
-    curl -fL --retry 5 --retry-delay 2 --connect-timeout 15 \
-        "${PANEL_ZIP_URL}" -o "${zip}" \
-        || die "Could not download panel ZIP from: ${PANEL_ZIP_URL}"
+# ------------------------------------------------------------
+# Validate actual app.js
+# ------------------------------------------------------------
 
-    [[ -s "${zip}" ]] || die "Downloaded ZIP is empty."
+if [ -f app.js ]; then
+    log "Checking app.js syntax..."
+    node --check app.js || die "app.js has a JavaScript syntax error."
+fi
 
-    log "Checking ZIP archive..."
-    unzip -tq "${zip}" || die "The downloaded file is not a valid ZIP archive."
+# ------------------------------------------------------------
+# Install npm dependencies
+# ------------------------------------------------------------
 
-    rm -rf "${extract}"
-    mkdir -p "${extract}"
-    unzip -q "${zip}" -d "${extract}"
+log "Installing panel dependencies..."
 
-    # The supplied archive contains a top-level "panel/" directory.
-    # Also support an archive whose files are at the root.
-    local source=""
-    if [[ -d "${extract}/panel" ]]; then
-        source="${extract}/panel"
-    else
-        source="${extract}"
-    fi
+export npm_config_audit=false
+export npm_config_fund=false
 
-    [[ -f "${source}/package.json" ]] || \
-        die "package.json was not found in the downloaded ZIP."
-
-    log "Installing panel into ${APP_DIR}..."
-    systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
-
-    rm -rf "${APP_DIR}"
-    mkdir -p "${APP_DIR}"
-
-    # Copy the actual application while excluding Git metadata and editor files.
-    cp -a "${source}/." "${APP_DIR}/"
-    rm -rf "${APP_DIR}/.git" "${APP_DIR}/.vscode"
-
-    # Runtime directories used by the panel.
-    mkdir -p \
-        "${APP_DIR}/servers" \
-        "${APP_DIR}/backups" \
-        "${APP_DIR}/uploads" \
-        "${APP_DIR}/temp" \
-        "${APP_DIR}/public/uploads/profiles" \
-        "${APP_DIR}/public/worlds"
-
-    rm -rf "${extract}" "${zip}"
-}
-
-install_node_dependencies() {
-    cd "${APP_DIR}"
-
-    log "Installing Node.js dependencies..."
-    if [[ -f package-lock.json ]]; then
-        npm ci --omit=dev
-    else
+if [ -f package-lock.json ]; then
+    npm ci --omit=dev || {
+        warn "npm ci failed; trying npm install..."
         npm install --omit=dev
-    fi
+    }
+else
+    npm install --omit=dev
+fi
 
-    # The supplied project uses sqlite3 and may need a native build on some
-    # architectures. Rebuild it explicitly after dependency installation.
-    npm rebuild sqlite3 || warn "sqlite3 rebuild returned a non-zero status; npm's installed binary may still work."
+# Native dependencies may need rebuilding.
+npm rebuild || warn "npm rebuild reported an error; continuing."
 
-    node --check app.js || die "app.js contains a JavaScript syntax error."
+# ------------------------------------------------------------
+# Check important modules
+# ------------------------------------------------------------
 
-    log "Node.js dependencies installed successfully."
+node - <<'NODE'
+const modules = [
+  "express",
+  "express-session",
+  "sqlite3",
+  "bcryptjs",
+  "multer",
+  "socket.io",
+  "axios",
+  "rcon-client",
+  "prismarine-nbt"
+];
+
+const missing = [];
+
+for (const name of modules) {
+  try {
+    require(name);
+  } catch (e) {
+    missing.push(name + ": " + e.message);
+  }
 }
 
-configure_environment() {
-    cat > "${APP_DIR}/.env" <<EOF
-NODE_ENV=production
-PORT=${PANEL_PORT}
-EOF
-
-    chmod 640 "${APP_DIR}/.env"
+if (missing.length) {
+  console.error("\nRequired module check failed:");
+  for (const item of missing) console.error(" - " + item);
+  process.exit(1);
 }
 
-configure_permissions() {
-    log "Setting application permissions..."
-    chown -R "${PANEL_USER}:${PANEL_USER}" "${APP_DIR}"
-    chmod 750 "${APP_DIR}"
-    chmod 640 "${APP_DIR}/package.json" 2>/dev/null || true
-    chmod 640 "${APP_DIR}/.env"
-}
+console.log("Required Node.js modules: OK");
+NODE
 
-create_systemd_service() {
-    log "Creating systemd service..."
+# ------------------------------------------------------------
+# Runtime directories
+# ------------------------------------------------------------
 
-    cat > "/etc/systemd/system/${SERVICE_NAME}" <<EOF
-[Unit]
-Description=NRB Minecraft Panel
-Documentation=https://github.com/notroboy67-htp/Notroboy-
-After=network-online.target
-Wants=network-online.target
+mkdir -p \
+    servers \
+    backups \
+    uploads \
+    temp \
+    public/uploads \
+    public/uploads/profiles
 
-[Service]
-Type=simple
-User=${PANEL_USER}
-Group=${PANEL_USER}
-WorkingDirectory=${APP_DIR}
-EnvironmentFile=${APP_DIR}/.env
-Environment=HOME=${APP_DIR}
-Environment=NODE_ENV=production
-ExecStart=/usr/bin/node ${APP_DIR}/app.js
-Restart=always
-RestartSec=5
-TimeoutStopSec=30
-KillSignal=SIGTERM
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ReadWritePaths=${APP_DIR}
+# ------------------------------------------------------------
+# Determine start command
+# ------------------------------------------------------------
 
-[Install]
-WantedBy=multi-user.target
-EOF
+START_SCRIPT="$(node -e '
+try {
+ const p=require("./package.json");
+ process.stdout.write((p.scripts && p.scripts.start) || "");
+} catch(e) {}
+' 2>/dev/null || true)"
 
-    systemctl daemon-reload
-    systemctl enable "${SERVICE_NAME}"
-}
+if [ -n "$START_SCRIPT" ]; then
+    START_MODE="npm"
+else
+    [ -f app.js ] || die "No npm start script and app.js was not found."
+    START_MODE="node"
+fi
 
-configure_firewall() {
-    if command -v ufw >/dev/null 2>&1; then
-        if ufw status 2>/dev/null | grep -qi "Status: active"; then
-            log "Opening TCP port ${PANEL_PORT} in UFW..."
-            ufw allow "${PANEL_PORT}/tcp" >/dev/null || \
-                warn "Could not update UFW rules."
-        fi
-    fi
-}
+# ------------------------------------------------------------
+# Java check
+# ------------------------------------------------------------
 
-start_panel() {
-    log "Starting ${APP_NAME}..."
-    systemctl restart "${SERVICE_NAME}"
+if has java; then
+    log "Java: $(java -version 2>&1 | head -n 1)"
+else
+    warn "Java is not installed."
+    warn "The web panel can start, but Minecraft Java servers require Java."
+fi
 
-    sleep 3
+# ------------------------------------------------------------
+# Finish
+# ------------------------------------------------------------
 
-    if ! systemctl is-active --quiet "${SERVICE_NAME}"; then
-        warn "Panel service did not stay running."
-        echo
-        systemctl --no-pager --full status "${SERVICE_NAME}" || true
-        echo
-        warn "Recent logs:"
-        journalctl -u "${SERVICE_NAME}" -n 80 --no-pager || true
-        die "Installation completed, but the panel failed to start."
-    fi
-}
+export NODE_ENV="${NODE_ENV:-production}"
+export PORT
 
-get_ip() {
-    local ip=""
-    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-    [[ -n "${ip}" ]] && echo "${ip}" || echo "YOUR_SERVER_IP"
-}
+echo
+echo "============================================================"
+echo "          NRB PANEL - INSTALLATION COMPLETE"
+echo "============================================================"
+echo
+echo "Panel directory : $APP_ROOT"
+echo "Node.js         : $(node --version)"
+echo "npm             : $(npm --version)"
+echo "Port            : $PORT"
+echo
 
-print_success() {
-    local ip
-    ip="$(get_ip)"
+if [ "$START_MODE" = "npm" ]; then
+    echo "Start command   : npm start"
+else
+    echo "Start command   : node app.js"
+fi
 
-    echo
-    echo "============================================================"
-    echo "        NRB MINECRAFT PANEL - INSTALLATION COMPLETE"
-    echo "============================================================"
-    echo
-    echo " Panel URL : http://${ip}:${PANEL_PORT}"
-    echo " Local URL : http://127.0.0.1:${PANEL_PORT}"
-    echo
-    echo " Default login:"
-    echo "   Username : admin"
-    echo "   Password : admin123"
-    echo
-    echo " IMPORTANT: Change the default password immediately."
-    echo
-    echo " Service:"
-    echo "   systemctl status ${SERVICE_NAME}"
-    echo "   systemctl restart ${SERVICE_NAME}"
-    echo "   systemctl stop ${SERVICE_NAME}"
-    echo "   journalctl -u ${SERVICE_NAME} -f"
-    echo
-    echo " Application directory:"
-    echo "   ${APP_DIR}"
-    echo
-    echo " Panel ZIP source:"
-    echo "   ${PANEL_ZIP_URL}"
-    echo
-    echo "============================================================"
-}
+echo
+echo "Docker: publish port $PORT."
+echo "Codespaces: forward port $PORT."
+echo
+echo "Starting the panel in the foreground..."
+echo "Press Ctrl+C to stop."
+echo "============================================================"
+echo
 
-main() {
-    require_root
-    detect_os
-
-    log "Starting NRB Minecraft Panel one-click installation..."
-    log "Target directory: ${APP_DIR}"
-    log "Panel port: ${PANEL_PORT}"
-
-    install_packages
-    create_user
-    download_panel
-    install_node_dependencies
-    configure_environment
-    configure_permissions
-    create_systemd_service
-    configure_firewall
-    start_panel
-    print_success
-}
-
-main "$@"
+if [ "$START_MODE" = "npm" ]; then
+    exec npm start
+else
+    exec node app.js
+fi
